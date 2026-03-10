@@ -132,6 +132,8 @@ class VerdiqtSidebar {
     async handleReviewsData(reviews) {
         try {
             console.log('Verdiqt: Handling reviews data...');
+            console.log('Verdiqt: Current domain:', window.location.hostname);
+            console.log('Verdiqt: User agent:', navigator.userAgent);
             
             // Clear timeout
             if (this.scrapePromise?.timeout) {
@@ -141,9 +143,12 @@ class VerdiqtSidebar {
             console.log(`Verdiqt: Found ${reviews.length} reviews`);
             
             if (!reviews || reviews.length === 0) {
-                this.showError('No reviews found on this page. Make sure you are on a product page with customer reviews.');
+                this.showError('No reviews found on this page. Make sure you are on a page with text content to analyze.');
                 return;
             }
+
+            // Log sample reviews for debugging
+            console.log('Verdiqt: Sample reviews:', reviews.slice(0, 2).map(r => r.substring(0, 100) + '...'));
 
             // Step 2: Analyze reviews with backend
             console.log('Verdiqt: Calling backend...');
@@ -170,6 +175,7 @@ class VerdiqtSidebar {
 
         } catch (error) {
             console.error('Verdiqt: Error handling reviews data:', error);
+            console.error('Verdiqt: Error occurred on domain:', window.location.hostname);
             this.showError(error.message);
             
             if (this.scrapePromise?.reject) {
@@ -185,20 +191,64 @@ class VerdiqtSidebar {
 
         try {
             console.log('Verdiqt: Fetching from backend with', reviews.length, 'reviews');
+            console.log('Verdiqt: Current URL:', window.location.href);
+            console.log('Verdiqt: Current domain:', window.location.hostname);
             
-            const response = await fetch('http://localhost:8000/analyze', {
+            // Try multiple backend URLs in order of preference
+            const backendUrls = [
+                'http://localhost:8000',
+                'http://127.0.0.1:8000',
+                'http://0.0.0.0:8000'
+            ];
+            
+            let workingUrl = null;
+            
+            // Test which backend URL works
+            for (const url of backendUrls) {
+                try {
+                    console.log(`Verdiqt: Testing backend URL: ${url}`);
+                    
+                    const healthResponse = await fetch(`${url}/health`, {
+                        method: 'GET',
+                        mode: 'cors',
+                        credentials: 'omit',
+                        signal: controller.signal
+                    });
+                    
+                    if (healthResponse.ok) {
+                        workingUrl = url;
+                        console.log(`Verdiqt: Found working backend URL: ${url}`);
+                        break;
+                    }
+                } catch (e) {
+                    console.log(`Verdiqt: Backend URL ${url} failed:`, e.message);
+                    continue;
+                }
+            }
+            
+            if (!workingUrl) {
+                throw new Error('Cannot connect to backend on any URL. Make sure backend is running: cd backend && uvicorn main:app --reload');
+            }
+            
+            console.log('Verdiqt: Backend health check passed, proceeding with analysis...');
+            
+            const response = await fetch(`${workingUrl}/analyze`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({ reviews }),
+                mode: 'cors',
+                credentials: 'omit',
                 signal: controller.signal
             });
 
             clearTimeout(timeoutId);
 
             if (!response.ok) {
-                throw new Error('Backend returned error. Make sure Verdiqt backend is running: cd backend && uvicorn main:app --reload');
+                const errorText = await response.text();
+                console.error('Verdiqt: Backend error response:', errorText);
+                throw new Error(`Backend returned error (${response.status}): ${errorText}`);
             }
 
             const result = await response.json();
@@ -208,12 +258,25 @@ class VerdiqtSidebar {
         } catch (error) {
             clearTimeout(timeoutId);
             console.error('Verdiqt: Backend error:', error);
+            console.error('Verdiqt: Error details:', {
+                name: error.name,
+                message: error.message,
+                stack: error.stack
+            });
             
             if (error.name === 'AbortError') {
                 throw new Error('Request timed out. Please try again.');
             }
-            if (error.message.includes('fetch') || error.message.includes('Failed to fetch')) {
-                throw new Error('Cannot connect to backend. Start it with: cd backend && uvicorn main:app --reload');
+            if (error.message.includes('fetch') || error.message.includes('Failed to fetch') || error.message.includes('NetworkError')) {
+                const domain = window.location.hostname;
+                if (domain.includes('reddit.com') || domain.includes('flipkart.com') || domain.includes('facebook.com')) {
+                    throw new Error(`${domain} is blocking the connection to backend. This is a security restriction. Try using the extension on Amazon or other sites.`);
+                } else {
+                    throw new Error('Cannot connect to backend. Make sure Verdiqt backend is running: cd backend && uvicorn main:app --reload');
+                }
+            }
+            if (error.message.includes('CORS')) {
+                throw new Error('CORS error. Backend is running but browser is blocking the request.');
             }
             throw error;
         }
@@ -231,12 +294,27 @@ class VerdiqtSidebar {
         if (negativePercent) negativePercent.textContent = `${data.overall.negative}%`;
         if (neutralPercent) neutralPercent.textContent = `${data.overall.neutral}%`;
 
-        // Show summary message instead of individual reviews
+        // Show summary message with language information
         if (this.reviewsList) {
+            const languagesList = data.languages_detected || [];
+            const languageBadges = languagesList.map(lang => 
+                `<span class="language-pill">🌐 ${lang}</span>`
+            ).join('');
+            
             this.reviewsList.innerHTML = `
                 <div style="text-align: center; padding: 20px; color: #CBD5E0;">
                     <p style="font-size: 16px; margin-bottom: 10px;">✅ Analysis Complete!</p>
-                    <p style="font-size: 14px;">Analyzed ${data.reviews.length} reviews</p>
+                    <p style="font-size: 14px; margin-bottom: 15px;">Analyzed ${data.reviews.length} reviews</p>
+                    
+                    ${languagesList.length > 0 ? `
+                        <div style="margin-bottom: 15px;">
+                            <p style="font-size: 12px; margin-bottom: 8px; opacity: 0.8;">Languages Detected:</p>
+                            <div class="languages-container">
+                                ${languageBadges}
+                            </div>
+                        </div>
+                    ` : ''}
+                    
                     <p style="font-size: 12px; margin-top: 10px; opacity: 0.7;">Sentiment badges are now visible beside each review on the page</p>
                 </div>
             `;
@@ -290,9 +368,57 @@ class VerdiqtSidebar {
         
         const errorText = document.getElementById('error-text');
         if (errorText) {
-            errorText.textContent = message;
+            // Add retry button for connection errors
+            if (message.includes('Cannot connect') || message.includes('CORS')) {
+                errorText.innerHTML = `
+                    <div style="text-align: center; padding: 10px;">
+                        <p style="margin-bottom: 15px; color: #EF4444; font-size: 14px;">${message}</p>
+                        <button onclick="window.verdiqtSidebar.retryConnection()" style="
+                            background: #667EEA !important;
+                            color: white !important;
+                            border: none !important;
+                            padding: 10px 20px !important;
+                            border-radius: 6px !important;
+                            cursor: pointer !important;
+                            font-size: 13px !important;
+                            margin-right: 10px !important;
+                            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+                            font-weight: 500 !important;
+                        ">🔄 Retry Connection</button>
+                        <button onclick="window.verdiqtSidebar.testBackend()" style="
+                            background: #22C55E !important;
+                            color: white !important;
+                            border: none !important;
+                            padding: 10px 20px !important;
+                            border-radius: 6px !important;
+                            cursor: pointer !important;
+                            font-size: 13px !important;
+                            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+                            font-weight: 500 !important;
+                        ">🧪 Test Backend</button>
+                    </div>
+                `;
+            } else {
+                errorText.innerHTML = `<p style="color: #EF4444; text-align: center; padding: 10px;">${message}</p>`;
+            }
         }
         this.showSection('error');
+    }
+
+    async retryConnection() {
+        console.log('Verdiqt: Retrying connection...');
+        this.loadAndAnalyze();
+    }
+
+    async testBackend() {
+        console.log('Verdiqt: Testing backend directly...');
+        try {
+            const response = await fetch('http://localhost:8000/health');
+            const data = await response.json();
+            alert(`Backend Test Result:\n${JSON.stringify(data, null, 2)}`);
+        } catch (error) {
+            alert(`Backend Test Failed:\n${error.message}`);
+        }
     }
 
     hideSidebar() {
@@ -318,4 +444,4 @@ class VerdiqtSidebar {
 
 // Initialize sidebar immediately (not waiting for DOMContentLoaded)
 console.log('Verdiqt: Creating sidebar instance...');
-new VerdiqtSidebar();
+window.verdiqtSidebar = new VerdiqtSidebar();

@@ -1,8 +1,9 @@
-# FastAPI backend for Verdiqt Chrome extension with sentiment analysis
+# FastAPI backend for Verdiqt Chrome extension with multilingual sentiment analysis
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from transformers import pipeline
+from langdetect import detect, LangDetectException
 from typing import List
 import logging
 
@@ -21,14 +22,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load sentiment analysis model once on startup
+# Language mapping for Indian regional languages
+LANGUAGE_MAP = {
+    "en": "English",
+    "hi": "Hindi", 
+    "ta": "Tamil",
+    "te": "Telugu",
+    "kn": "Kannada",
+    "ml": "Malayalam",
+    "bn": "Bengali",
+    "mr": "Marathi",
+    "gu": "Gujarati",
+    "pa": "Punjabi",
+    "or": "Odia"
+}
+
+def detect_language(text):
+    """Detect language of the given text"""
+    try:
+        code = detect(text)
+        return LANGUAGE_MAP.get(code, "Other")
+    except LangDetectException:
+        return "Unknown"
+
+# Load multilingual sentiment analysis model once on startup
 try:
+    # This model supports 100+ languages including all Indian languages
     sentiment_pipeline = pipeline(
-        "sentiment-analysis",
+        "text-classification",
         model="cardiffnlp/twitter-xlm-roberta-base-sentiment",
-        return_all_scores=True
+        return_all_scores=False  # Changed to False to get single best prediction
     )
-    logger.info("Sentiment analysis model loaded successfully")
+    logger.info("Multilingual sentiment analysis model loaded successfully")
 except Exception as e:
     logger.error(f"Failed to load sentiment model: {e}")
     sentiment_pipeline = None
@@ -40,15 +65,46 @@ class ReviewResult(BaseModel):
     text: str
     sentiment: str
     confidence: float
+    language: str
 
 class AnalysisResponse(BaseModel):
     reviews: List[ReviewResult]
     overall: dict
+    languages_detected: List[str]
 
 @app.get("/health")
 def health_check():
     models_loaded = sentiment_pipeline is not None
     return {"status": "ok", "models_loaded": models_loaded}
+
+@app.get("/test")
+def test_analysis():
+    """Test endpoint to verify sentiment analysis is working"""
+    test_reviews = [
+        "This product is amazing and I love it!",
+        "Terrible quality, waste of money, very disappointed",
+        "It's okay, nothing special but works fine"
+    ]
+    
+    if sentiment_pipeline is None:
+        return {"error": "Sentiment pipeline not loaded"}
+    
+    results = []
+    for review in test_reviews:
+        try:
+            prediction = sentiment_pipeline(review)
+            results.append({
+                "text": review,
+                "raw_prediction": prediction,
+                "type": str(type(prediction))
+            })
+        except Exception as e:
+            results.append({
+                "text": review,
+                "error": str(e)
+            })
+    
+    return {"test_results": results}
 
 @app.post("/analyze", response_model=AnalysisResponse)
 def analyze_reviews(input_data: ReviewsInput):
@@ -60,23 +116,78 @@ def analyze_reviews(input_data: ReviewsInput):
         
         results = []
         sentiment_counts = {"positive": 0, "negative": 0, "neutral": 0}
+        languages_detected = set()
         
         for review_text in input_data.reviews:
             try:
+                # Detect language
+                detected_language = detect_language(review_text)
+                languages_detected.add(detected_language)
+                print(f"Verdiqt: Detected language: {detected_language}")
+                
                 # Get sentiment predictions
                 predictions = sentiment_pipeline(review_text)
+                print(f"Verdiqt: Raw prediction for '{review_text[:50]}...': {predictions}")
                 
-                # The model returns [{'label': 'positive', 'score': 0.93}] format
-                best_prediction = predictions[0]  # First (and only) result
+                # Handle different response formats more robustly
+                best_prediction = None
                 
-                # Map model labels to our format (this model returns direct labels)
-                sentiment = best_prediction['label'].lower()
-                confidence = round(best_prediction['score'] * 100, 1)
+                if isinstance(predictions, list) and len(predictions) > 0:
+                    if isinstance(predictions[0], dict):
+                        # Single prediction format: [{'label': 'POSITIVE', 'score': 0.9}]
+                        best_prediction = predictions[0]
+                    elif isinstance(predictions[0], list) and len(predictions[0]) > 0:
+                        # Multiple predictions format: [[{'label': 'POSITIVE', 'score': 0.9}, ...]]
+                        best_prediction = max(predictions[0], key=lambda x: x['score'])
+                    else:
+                        # Fallback
+                        best_prediction = predictions[0] if predictions[0] else None
+                elif isinstance(predictions, dict):
+                    # Direct prediction format: {'label': 'POSITIVE', 'score': 0.9}
+                    best_prediction = predictions
+                else:
+                    print(f"Verdiqt: Unexpected prediction format: {type(predictions)} - {predictions}")
+                    best_prediction = None
+                
+                if best_prediction is None:
+                    raise Exception("Could not parse prediction result")
+                
+                # Map model labels to our format with more robust mapping
+                original_label = str(best_prediction.get('label', ''))
+                label = original_label.upper()
+                score = float(best_prediction.get('score', 0))
+                
+                print(f"Verdiqt: Parsed - Original: {original_label}, Upper: {label}, Score: {score}")
+                
+                # Enhanced label mapping - check both original and uppercase
+                if (any(pos in label for pos in ['POSITIVE', 'POS', 'LABEL_2']) or 
+                    original_label.lower() == 'positive'):
+                    sentiment = "positive"
+                elif (any(neg in label for neg in ['NEGATIVE', 'NEG', 'LABEL_0']) or 
+                      original_label.lower() == 'negative'):
+                    sentiment = "negative"
+                elif (any(neu in label for neu in ['NEUTRAL', 'NEU', 'LABEL_1']) or 
+                      original_label.lower() == 'neutral'):
+                    sentiment = "neutral"
+                else:
+                    # If we can't determine sentiment from label, use score
+                    if score > 0.6:
+                        sentiment = "positive"
+                    elif score < 0.4:
+                        sentiment = "negative"
+                    else:
+                        sentiment = "neutral"
+                    print(f"Verdiqt: Used score-based mapping for unknown label '{original_label}': {sentiment}")
+                
+                confidence = round(score * 100, 1)
+                
+                print(f"Verdiqt: Final result - Sentiment: {sentiment}, Confidence: {confidence}%, Language: {detected_language}")
                 
                 results.append(ReviewResult(
                     text=review_text,
                     sentiment=sentiment,
-                    confidence=confidence
+                    confidence=confidence,
+                    language=detected_language
                 ))
                 
                 sentiment_counts[sentiment] += 1
@@ -84,10 +195,14 @@ def analyze_reviews(input_data: ReviewsInput):
             except Exception as e:
                 logger.error(f"Error processing review: {e}")
                 # Default to neutral if processing fails
+                detected_language = detect_language(review_text)
+                languages_detected.add(detected_language)
+                
                 results.append(ReviewResult(
                     text=review_text,
                     sentiment="neutral",
-                    confidence=0.0
+                    confidence=0.0,
+                    language=detected_language
                 ))
                 sentiment_counts["neutral"] += 1
         
@@ -99,7 +214,14 @@ def analyze_reviews(input_data: ReviewsInput):
             "neutral": round((sentiment_counts["neutral"] / total_reviews) * 100) if total_reviews > 0 else 0
         }
         
-        return AnalysisResponse(reviews=results, overall=overall)
+        # Convert languages set to sorted list
+        languages_list = sorted(list(languages_detected))
+        
+        return AnalysisResponse(
+            reviews=results, 
+            overall=overall,
+            languages_detected=languages_list
+        )
         
     except HTTPException:
         raise
